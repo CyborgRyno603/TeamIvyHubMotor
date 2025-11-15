@@ -1,0 +1,286 @@
+/*
+ * ---------------------------------------------------------------------------
+ * SHELL ECO-MARATHON BLDC MOTOR CONTROLLER (Hybrid Shield Prototype)
+ * ---------------------------------------------------------------------------
+ * Hardware: Arduino Uno + IR2104 Gate Drivers + IRFB4110 MOSFETs
+ * Motor: 48V 500W BLDC (Sensored)
+ * Features:
+ * - Six-Step Trapezoidal Commutation
+ * - Soft-Start Ramp (Pulse & Glide Optimization)
+ * - Real-time Joule/Energy Counter
+ * - RPM Calculation
+ * - Safety Deadband & Illegal Hall State Protection
+ * ---------------------------------------------------------------------------
+ */
+
+// ==========================
+// 1. PIN DEFINITIONS
+// ==========================
+
+// --- Phase A (IR2104) ---
+const int phaseA_IN = 8;   // PWM / High-Low Control
+const int phaseA_SD = 9;   // Shutdown (Enable)
+
+// --- Phase B (IR2104) ---
+const int phaseB_IN = 10;
+const int phaseB_SD = 11;
+
+// --- Phase C (IR2104) ---
+const int phaseC_IN = 12;
+const int phaseC_SD = 13;
+
+// --- Hall Sensors (Motor) ---
+const int hallA = 2;       // Yellow Wire (Interrupt Pin)
+const int hallB = 3;       // Green Wire (Interrupt Pin)
+const int hallC = 4;       // Blue Wire
+
+// --- Analog Inputs ---
+const int currentPin = A0; // ACS758 Current Sensor Output
+const int throttlePin = A1;// Potentiometer / Thumb Throttle Signal
+const int voltagePin = A2; // Battery Voltage Divider (Optional)
+
+// ==========================
+// 2. CONFIGURATION & TUNING
+// ==========================
+
+// Ramp / Soft Start
+const int RAMP_DELAY = 5;  // ms between PWM steps. Higher = Slower Accel.
+                           // 5ms * 255 steps = ~1.25 sec to full power.
+const int DEADBAND = 15;   // Throttle noise floor (0-255 scale)
+
+// Motor Specs
+const int POLE_PAIRS = 23; // Standard for E-Bike Hub Motors (46 poles)
+
+// Current Sensor Cal (ACS758-50B is roughly 40mV/Amp, but we auto-zero)
+const float SENSITIVITY = 0.04; // Volts per Amp (Check your specific sensor datasheet)
+
+// ==========================
+// 3. GLOBAL VARIABLES
+// ==========================
+
+// Commutation
+int hallState = 0;
+
+// Throttle Logic
+int targetPWM = 0;
+int currentPWM = 0;
+unsigned long lastRampTime = 0;
+
+// Speed / RPM
+volatile long hallPulseCount = 0; // Counted by interrupt
+unsigned long lastSpeedTime = 0;
+float rpm = 0;
+
+// Energy / Joules
+float totalJoules = 0;
+float zeroAmpVoltage = 2.5; // Will be calibrated in setup
+unsigned long lastEnergyTime = 0;
+
+
+// ==========================
+// 4. SETUP
+// ==========================
+void setup() {
+  Serial.begin(115200); // Fast serial for logging
+  Serial.println("Initializing SEM Motor Controller...");
+
+  // Configure Pins
+  pinMode(phaseA_IN, OUTPUT); pinMode(phaseA_SD, OUTPUT);
+  pinMode(phaseB_IN, OUTPUT); pinMode(phaseB_SD, OUTPUT);
+  pinMode(phaseC_IN, OUTPUT); pinMode(phaseC_SD, OUTPUT);
+
+  // IMPORTANT: Hall sensors need Pull-up resistors. 
+  // If you didn't solder 10k resistors on the PCB, keep INPUT_PULLUP.
+  // If you DID solder 10k resistors, INPUT is fine, but PULLUP is safer.
+  pinMode(hallA, INPUT_PULLUP);
+  pinMode(hallB, INPUT_PULLUP);
+  pinMode(hallC, INPUT_PULLUP);
+
+  // Attach Interrupt for RPM counting (Hall A on Pin 2)
+  attachInterrupt(digitalPinToInterrupt(hallA), countHallPulse, CHANGE);
+
+  // --- Calibration Routine ---
+  Serial.print("Calibrating Current Sensor (Keep Motor OFF)... ");
+  long totalRaw = 0;
+  for(int i=0; i<50; i++) {
+    totalRaw += analogRead(currentPin);
+    delay(10);
+  }
+  zeroAmpVoltage = (totalRaw / 50.0) * (5.0 / 1023.0);
+  Serial.print("Zero Offset: "); Serial.print(zeroAmpVoltage); Serial.println(" V");
+  
+  Serial.println("Ready. Pulse & Glide Mode Active.");
+}
+
+
+// ==========================
+// 5. MAIN LOOP
+// ==========================
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // --- A. SPEED CALCULATION (Every 1000ms) ---
+  if (currentMillis - lastSpeedTime >= 1000) {
+    // RPM = (Pulses / (Poles * 3 phases)) * 60s
+    // Note: We only count interrupts on ONE hall sensor (Hall A).
+    // So standard calculation is: (Pulses / (PolePairs * 2)) * 60
+    // Hall A changes state twice per electrical cycle.
+    
+    rpm = (hallPulseCount / (float)(POLE_PAIRS * 2)) * 60.0;
+    hallPulseCount = 0; // Reset counter
+    lastSpeedTime = currentMillis;
+    
+    logTelemetry(); // Print stats to Serial
+  }
+
+  // --- B. ENERGY CALCULATION (Every 100ms) ---
+  if (currentMillis - lastEnergyTime >= 100) {
+    calculateJoules(currentMillis - lastEnergyTime);
+    lastEnergyTime = currentMillis;
+  }
+
+  // --- C. THROTTLE & RAMP LOGIC ---
+  // 1. Read Throttle
+  int rawThrottle = analogRead(throttlePin);
+  int mappedThrottle = map(rawThrottle, 0, 1023, 0, 255);
+
+  // 2. Apply Deadband
+  if (mappedThrottle < DEADBAND) {
+    targetPWM = 0;
+  } else {
+    targetPWM = mappedThrottle;
+  }
+
+  // 3. Ramp (Soft Start for Pulse, Instant Cut for Glide)
+  if (currentMillis - lastRampTime >= RAMP_DELAY) {
+    if (currentPWM < targetPWM) {
+      currentPWM++; // Ramp Up
+    } else if (currentPWM > targetPWM) {
+      currentPWM = targetPWM; // Instant Cut (No regen/drag)
+    }
+    lastRampTime = currentMillis;
+  }
+
+  // --- D. HALL READING & COMMUTATION ---
+  // If throttle is 0, Force Coast (FLOAT)
+  if (currentPWM == 0) {
+    stopMotor();
+  } else {
+    readHallsAndCommutate(currentPWM);
+  }
+}
+
+// ==========================
+// 6. HELPER FUNCTIONS
+// ==========================
+
+// --- Read Halls and Fire Phases ---
+void readHallsAndCommutate(int pwmVal) {
+  int h1 = digitalRead(hallA);
+  int h2 = digitalRead(hallB);
+  int h3 = digitalRead(hallC);
+
+  // Combine into 3-bit integer: (001 to 110)
+  hallState = (h1 << 2) | (h2 << 1) | h3;
+
+  switch (hallState) {
+    // 1 = HIGH Side ON (PWM), 0 = LOW Side ON (GND), -1 = FLOAT (OFF)
+    
+    case 5: // 101
+      drivePhase('A', 1, pwmVal); drivePhase('B', 0, 0); drivePhase('C', -1, 0);
+      break;
+    case 1: // 001
+      drivePhase('A', 1, pwmVal); drivePhase('B', -1, 0); drivePhase('C', 0, 0);
+      break;
+    case 3: // 011
+      drivePhase('A', -1, 0); drivePhase('B', 1, pwmVal); drivePhase('C', 0, 0);
+      break;
+    case 2: // 010
+      drivePhase('A', 0, 0); drivePhase('B', 1, pwmVal); drivePhase('C', -1, 0);
+      break;
+    case 6: // 110
+      drivePhase('A', 0, 0); drivePhase('B', -1, 0); drivePhase('C', 1, pwmVal);
+      break;
+    case 4: // 100
+      drivePhase('A', -1, 0); drivePhase('B', 0, 0); drivePhase('C', 1, pwmVal);
+      break;
+    default:
+      // Error State (000 or 111) - Wire broken or magnets misaligned
+      stopMotor();
+      break;
+  }
+}
+
+// --- Drive Hardware (IR2104 Logic) ---
+void drivePhase(char phase, int state, int pwmValue) {
+  int pinIN, pinSD;
+
+  // Select Pins
+  if (phase == 'A') { pinIN = phaseA_IN; pinSD = phaseA_SD; }
+  else if (phase == 'B') { pinIN = phaseB_IN; pinSD = phaseB_SD; }
+  else { pinIN = phaseC_IN; pinSD = phaseC_SD; }
+
+  if (state == -1) {
+    // FLOAT: SD = LOW (Both FETs OFF)
+    digitalWrite(pinSD, LOW);
+    digitalWrite(pinIN, LOW);
+  } 
+  else {
+    // DRIVE: SD = HIGH
+    digitalWrite(pinSD, HIGH);
+    
+    if (state == 1) {
+      // HIGH SIDE ON -> Apply PWM
+      analogWrite(pinIN, pwmValue);
+    } else {
+      // LOW SIDE ON -> Solid Low (IR2104 Logic: IN LOW = LO High)
+      digitalWrite(pinIN, LOW);
+    }
+  }
+}
+
+// --- Safety Stop ---
+void stopMotor() {
+  digitalWrite(phaseA_SD, LOW);
+  digitalWrite(phaseB_SD, LOW);
+  digitalWrite(phaseC_SD, LOW);
+  
+  digitalWrite(phaseA_IN, LOW);
+  digitalWrite(phaseB_IN, LOW);
+  digitalWrite(phaseC_IN, LOW);
+}
+
+// --- Energy Calculation ---
+void calculateJoules(unsigned long timeDeltaMs) {
+  // 1. Read Raw Voltage
+  float sensorV = analogRead(currentPin) * (5.0 / 1023.0);
+  
+  // 2. Convert to Amps (Abs value to handle slight noise)
+  float amps = abs(sensorV - zeroAmpVoltage) / SENSITIVITY;
+  
+  // 3. Filter low noise (ignore < 0.5A)
+  if (amps < 0.5) amps = 0;
+
+  // 4. Get Battery Voltage (Assuming divider 48V->5V is approx 11:1 ratio)
+  // If no voltage sensor, assume constant 48V
+  float battV = 48.0; 
+  // float battV = analogRead(voltagePin) * (5.0/1023.0) * 11.0; 
+
+  // 5. Power (Watts) = Volts * Amps
+  float power = battV * amps;
+
+  // 6. Joules = Watts * Seconds
+  totalJoules += power * (timeDeltaMs / 1000.0);
+}
+
+// --- Interrupt Function for RPM ---
+void countHallPulse() {
+  hallPulseCount++;
+}
+
+// --- Serial Logging ---
+void logTelemetry() {
+  Serial.print("RPM: "); Serial.print(rpm);
+  Serial.print(" | PWM: "); Serial.print(currentPWM);
+  Serial.print(" | Energy: "); Serial.print(totalJoules); Serial.println(" J");
+}
