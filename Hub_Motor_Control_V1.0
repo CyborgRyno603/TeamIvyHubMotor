@@ -1,12 +1,32 @@
+
+
+// Temporary variables for code testing
+int Limit = 100
+
+
+
+
+
 void setup() {
 
+    // Pin A0 checks the currect voltage
+    // Pins D8, D12, and D13 control whether or not the circuit runs
+    if input(A0) > "Limit"
+        pinMode(D8)
+        pinMode(D12)
+        pinMode(D13)
+    return
 
+    pinMode(D8)
+    pinMode(D12)
+    pinMode(D13)
 
 }
 
 
 
 void loop() {
+
 
 
 
